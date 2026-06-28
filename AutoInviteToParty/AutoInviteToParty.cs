@@ -16,6 +16,7 @@ using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Hooking;
 using Dalamud.Interface.Utility.Raii;
+using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Group;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
@@ -94,6 +95,8 @@ public unsafe class AutoInviteToParty : ModuleBase
         {
             HelpMessage = "切换 / 开启 / 关闭自动邀请组队: /pdr autoinvite [on|off|toggle]"
         });
+
+        FrameworkManager.Instance().Reg(OnUpdate, 100);
     }
 
     protected override void Uninit()
@@ -102,6 +105,9 @@ public unsafe class AutoInviteToParty : ModuleBase
 
         addMsgSourceEntryHook?.Dispose();
         addMsgSourceEntryHook = null;
+
+        FrameworkManager.Instance().Unreg(OnUpdate);
+        pendingInvites.Clear();
     }
 
     private void OnCommand(string command, string args)
@@ -162,12 +168,12 @@ public unsafe class AutoInviteToParty : ModuleBase
 
         ImGui.NewLine();
 
-        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), "邀请间隔 (毫秒)");
+        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), "收到消息后的延迟 (毫秒)");
         using (ImRaii.PushIndent())
         {
             ImGui.SetNextItemWidth(200f * GlobalUIScale);
-            if (ImGui.SliderInt("###RateLimit", ref config.RateLimit, 200, 5000))
-                config.RateLimit = Math.Clamp(config.RateLimit, 200, 60000);
+            if (ImGui.SliderInt("###InviteDelay", ref config.InviteDelay, 0, 5000))
+                config.InviteDelay = Math.Clamp(config.InviteDelay, 0, 60000);
             if (ImGui.IsItemDeactivatedAfterEdit())
                 config.Save(this);
         }
@@ -237,20 +243,60 @@ public unsafe class AutoInviteToParty : ModuleBase
         if (SeString.Parse(sender.AsSpan()).Payloads.FirstOrDefault(p => p is PlayerPayload) is not PlayerPayload playerPayload)
             return;
 
-        // 频率限制
+        // 避免重复邀请同一人
+        if (pendingInvites.Any(x => x.ContentID == contentID))
+            return;
+
+        var inInstance = InInvitableInstance();
+        pendingInvites.Add(new PendingInvite
+        {
+            ExecuteAt = Environment.TickCount64 + config.InviteDelay,
+            ContentID = contentID,
+            PlayerName = playerPayload.PlayerName,
+            WorldId = (ushort)playerPayload.World.RowId,
+            InInstance = inInstance
+        });
+    }
+
+    private struct PendingInvite
+    {
+        public long ExecuteAt;
+        public ulong ContentID;
+        public string PlayerName;
+        public ushort WorldId;
+        public bool InInstance;
+    }
+    private readonly List<PendingInvite> pendingInvites = [];
+
+    private void OnUpdate(IFramework _)
+    {
         var now = Environment.TickCount64;
-        if (now <= nextInviteAt) return;
-        nextInviteAt = now + config.RateLimit;
+        for (int i = pendingInvites.Count - 1; i >= 0; i--)
+        {
+            var invite = pendingInvites[i];
+            if (now >= invite.ExecuteAt)
+            {
+                pendingInvites.RemoveAt(i);
+                ExecuteInvite(invite);
+            }
+        }
+    }
+
+    private void ExecuteInvite(PendingInvite invite)
+    {
+        // 发送前再次检查满员状态
+        var group = GroupManager.Instance()->GetGroup();
+        if (group->MemberCount >= 8) return;
 
         if (config.PrintMessage)
-            NotifyHelper.Instance().Chat($"[自动邀请组队] 正在邀请 {playerPayload.PlayerName}");
+            NotifyHelper.Instance().Chat($"[自动邀请组队] 正在邀请 {invite.PlayerName}");
 
-        if (InInvitableInstance())
-            InfoProxyPartyInvite.Instance()->InviteToPartyInInstanceByContentId(contentID);
+        if (invite.InInstance)
+            InfoProxyPartyInvite.Instance()->InviteToPartyInInstanceByContentId(invite.ContentID);
         else
         {
-            fixed (byte* namePtr = ToTerminatedBytes(playerPayload.PlayerName))
-                InfoProxyPartyInvite.Instance()->InviteToParty(contentID, namePtr, (ushort)playerPayload.World.RowId);
+            fixed (byte* namePtr = ToTerminatedBytes(invite.PlayerName))
+                InfoProxyPartyInvite.Instance()->InviteToParty(invite.ContentID, namePtr, invite.WorldId);
         }
     }
 
@@ -273,7 +319,7 @@ public unsafe class AutoInviteToParty : ModuleBase
         public bool   Enabled = true;              // 自动邀请的运行开关 (可用指令 / 勾选切换)
         public string TextPattern = "111|求组队";  // 默认: 正则匹配 "111" 或 "求组队"
         public bool   RegexMatch  = true;
-        public int    RateLimit   = 500;           // 两次邀请最小间隔 (毫秒)
+        public int    InviteDelay = 1000;          // 发送邀请前的延迟 (毫秒)
         public bool   PrintMessage;
 
         public HashSet<XivChatType> ListenChannels = [XivChatType.Shout]; // 默认仅喊话频道

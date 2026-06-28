@@ -53,6 +53,9 @@ public class OccultPotNotifier : ModuleBase
 
     private Hook<RaptureLogModule.Delegates.AddMsgSourceEntry>? addMsgSourceEntryHook;
     private long lastArchivistReplyAt;
+    
+    private long   pendingArchivistReplyTime;
+    private string pendingArchivistReplyMsg = string.Empty;
 
     private Pot?   displayPot;
     private string displayText       = string.Empty;
@@ -254,7 +257,8 @@ public class OccultPotNotifier : ModuleBase
         if (prediction == null) return;
 
         lastArchivistReplyAt = now;
-        ChatManager.Instance().SendMessage($"/sh 北{prediction.Value.NorthMinute}南{prediction.Value.SouthMinute}");
+        pendingArchivistReplyMsg = $"/sh 北{prediction.Value.NorthMinute}南{prediction.Value.SouthMinute}";
+        pendingArchivistReplyTime = Environment.TickCount64 + 3000;
     }
 
     private (int NorthMinute, int SouthMinute)? GetPredictedMinutes()
@@ -347,6 +351,12 @@ public class OccultPotNotifier : ModuleBase
                         if (i % 4 != 3 && i != ChatChannels.Length - 1)
                             ImGui.SameLine();
                     }
+
+                    ImGui.SetNextItemWidth(150f * GlobalUIScale);
+                    if (ImGui.SliderInt("附加提示音 (<se.?>)###ChatSoundEffect", ref config.ChatSoundEffect, 0, 13))
+                        config.Save(this);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("设为 0 表示不附加提示音");
                 }
             }
         }
@@ -443,27 +453,7 @@ public class OccultPotNotifier : ModuleBase
             {
                 using (ImRaii.PushIndent())
                 {
-                    ImGui.TextUnformatted("自动切换为:");
-                    var auto = config.AutoSwitchFlags;
-                    (string Label, MarkerSet Flag)[] autoButtons =
-                    [
-                        ("北罐", MarkerSet.NorthPot),
-                        ("南罐", MarkerSet.SouthPot),
-                        ("续罐", MarkerSet.Reroll)
-                    ];
-                    for (var i = 0; i < autoButtons.Length; i++)
-                    {
-                        var (label, flag) = autoButtons[i];
-                        var on = auto.HasFlag(flag);
-                        if (ImGui.Checkbox($"{label}###CfgAuto{flag}", ref on))
-                        {
-                            config.AutoSwitchFlags = on ? auto | flag : auto & ~flag;
-                            config.Save(this);
-                        }
-
-                        if (i != autoButtons.Length - 1)
-                            ImGui.SameLine();
-                    }
+                    ImGui.TextColored(KnownColor.Orange.ToVector4(), "将根据您刚才触发或完成的罐子智能切换标记。");
                 }
             }
 
@@ -537,6 +527,15 @@ public class OccultPotNotifier : ModuleBase
             return;
         }
 
+        if (pendingArchivistReplyTime > 0 && Environment.TickCount64 >= pendingArchivistReplyTime)
+        {
+            var msg = pendingArchivistReplyMsg;
+            pendingArchivistReplyTime = 0;
+            pendingArchivistReplyMsg = string.Empty;
+            if (!string.IsNullOrEmpty(msg))
+                ChatManager.Instance().SendMessage(msg);
+        }
+
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         foreach (var fate in DService.Instance().Fate)
@@ -585,8 +584,9 @@ public class OccultPotNotifier : ModuleBase
         if (config.SendChat && config.ChatCommands.Count > 0)
         {
             SetPotFlag(pot);
+            var seSuffix = config.ChatSoundEffect > 0 ? $" <se.{config.ChatSoundEffect}>" : string.Empty;
             foreach (var cmd in config.ChatCommands)
-                ChatManager.Instance().SendMessage($"{cmd} 魔法罐约{minutes}分钟后在{pot.DirName}<flag>处刷新");
+                ChatManager.Instance().SendMessage($"{cmd} 魔法罐约{minutes}分钟后在{pot.DirName}<flag>处刷新{seSuffix}");
         }
     }
 
@@ -750,9 +750,26 @@ public class OccultPotNotifier : ModuleBase
         if (config.AutoSwitchOnLure && savedMarkers == null)
         {
             savedMarkers   = currentMarkers;
-            currentMarkers = config.AutoSwitchFlags;
+            currentMarkers = GetDynamicLureMarkers(localPlayer!.Position);
             markersDirty   = true;
         }
+    }
+
+    private MarkerSet GetDynamicLureMarkers(Vector3 playerPos)
+    {
+        var north = pots[0];
+        var south = pots[1];
+
+        var distNorth = Vector3.Distance(playerPos, north.World);
+        var distSouth = Vector3.Distance(playerPos, south.World);
+
+        if (distNorth < 150f && distNorth < distSouth)
+            return MarkerSet.NorthPot;
+
+        if (distSouth < 150f && distSouth < distNorth)
+            return MarkerSet.SouthPot;
+            
+        return MarkerSet.Reroll;
     }
 
     private void ClearLure()
@@ -1271,6 +1288,7 @@ public class OccultPotNotifier : ModuleBase
         public bool            SendNotification = true;
         public bool            SendChat;
         public HashSet<string> ChatCommands     = ["/p"];
+        public int             ChatSoundEffect  = 0;
         public int             LeadSeconds      = 300;
 
         // 史官功能
