@@ -32,6 +32,8 @@ using Dalamud.Hooking;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
+using InteropGenerator.Runtime;
+using Dalamud.Utility;
 
 namespace DailyRoutines.ModulesPublic;
 
@@ -53,9 +55,21 @@ public class OccultPotNotifier : ModuleBase
 
     private Hook<RaptureLogModule.Delegates.AddMsgSourceEntry>? addMsgSourceEntryHook;
     private long lastArchivistReplyAt;
-    
+
     private long   pendingArchivistReplyTime;
     private string pendingArchivistReplyMsg = string.Empty;
+
+    // 自动切换标记：记录最近一次所在的罐子方位 + 是否处于「续罐」阶段
+    private PotRegion lastPotRegion = PotRegion.North;
+    private bool      continuationActive;
+
+    // 捕获魔法罐「再帮你找一次财宝」气泡 / 对话提示
+    private unsafe delegate void ShowBattleTalkDelegate(UIModule* module, CStringPointer name, CStringPointer text, float duration, byte style);
+    private Hook<ShowBattleTalkDelegate>? showBattleTalkHook;
+
+    private unsafe delegate void ShowBattleTalkImageDelegate(
+        UIModule* module, CStringPointer name, CStringPointer text, float duration, uint image, byte style, int sound, uint entityID);
+    private Hook<ShowBattleTalkImageDelegate>? showBattleTalkImageHook;
 
     private Pot?   displayPot;
     private string displayText       = string.Empty;
@@ -158,7 +172,7 @@ public class OccultPotNotifier : ModuleBase
     #region 地图标记 - 状态
 
     private MarkerSet  currentMarkers = MarkerSet.None; // 当前生效的标记集合
-    private MarkerSet? savedMarkers;                    // 携带撒娇罐临时覆盖前保存的用户集合
+    private bool       autoSwitchEngaged;               // 自动切换是否正在接管标记（携带撒娇罐期间）
     private MarkerSet  placedMarkers  = MarkerSet.None; // 已实际放置在地图上的集合
     private uint       placedMapID;
     private bool       markersDirty;
@@ -181,6 +195,14 @@ public class OccultPotNotifier : ModuleBase
             AddMsgSourceEntryDetour
         );
         addMsgSourceEntryHook.Enable();
+
+        showBattleTalkHook ??= UIModule.Instance()->VirtualTable->HookVFuncFromName
+            ("ShowBattleTalk", (ShowBattleTalkDelegate)ShowBattleTalkDetour);
+        showBattleTalkHook.Enable();
+
+        showBattleTalkImageHook ??= UIModule.Instance()->VirtualTable->HookVFuncFromName
+            ("ShowBattleTalkImage", (ShowBattleTalkImageDelegate)ShowBattleTalkImageDetour);
+        showBattleTalkImageHook.Enable();
 
         currentMarkers = config.DefaultMarkers;
 
@@ -208,6 +230,12 @@ public class OccultPotNotifier : ModuleBase
 
         addMsgSourceEntryHook?.Dispose();
         addMsgSourceEntryHook = null;
+
+        showBattleTalkHook?.Dispose();
+        showBattleTalkHook = null;
+
+        showBattleTalkImageHook?.Dispose();
+        showBattleTalkImageHook = null;
 
         ClearMapMarkers();
 
@@ -253,19 +281,23 @@ public class OccultPotNotifier : ModuleBase
 
         if (!matched) return;
 
-        var prediction = GetPredictedMinutes();
-        if (prediction == null) return;
+        var predictionMsg = GetNextPredictedMessage();
+        if (predictionMsg == null) return;
 
         lastArchivistReplyAt = now;
-        pendingArchivistReplyMsg = $"/sh 北{prediction.Value.NorthMinute}南{prediction.Value.SouthMinute}";
+        pendingArchivistReplyMsg = $"/sh {predictionMsg}";
         pendingArchivistReplyTime = Environment.TickCount64 + 3000;
     }
 
-    private (int NorthMinute, int SouthMinute)? GetPredictedMinutes()
+    private string? GetNextPredictedMessage()
     {
         var north = pots[0];
         var south = pots[1];
-        
+
+        var alive = north.Alive ? north : south.Alive ? south : null;
+        if (alive != null)
+            return $"{alive.DirName}罐正在进行中";
+
         Pot? lastSpawned = null;
         if (north.SpawnTime > 0)
             lastSpawned = north;
@@ -274,13 +306,15 @@ public class OccultPotNotifier : ModuleBase
 
         if (lastSpawned == null) return null;
 
-        var lastMinute = DateTimeOffset.FromUnixTimeSeconds(lastSpawned.SpawnTime).ToLocalTime().Minute;
-        var otherMinute = (lastMinute + 30) % 60;
+        var other    = ReferenceEquals(lastSpawned, north) ? south : north;
+        var s        = lastSpawned.SpawnTime;
+        var now      = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var k        = now < s ? 0 : ((now - s) / 1800) + 1;
+        var nextTime = s + (k * 1800);
+        var nextPot  = k % 2 == 0 ? lastSpawned : other;
 
-        if (ReferenceEquals(lastSpawned, north))
-            return (lastMinute, otherMinute);
-        else
-            return (otherMinute, lastMinute);
+        var minute = DateTimeOffset.FromUnixTimeSeconds(nextTime).ToLocalTime().Minute;
+        return $"{nextPot.DirName}{minute}";
     }
 
     protected override void ConfigUI()
@@ -415,7 +449,6 @@ public class OccultPotNotifier : ModuleBase
         using (ImRaii.PushIndent())
         {
             ImGui.TextUnformatted("默认显示的标记 (可多选):");
-            using (ImRaii.Disabled(savedMarkers != null))
             {
                 var set = config.DefaultMarkers;
                 for (var i = 0; i < SwitchButtons.Length; i++)
@@ -429,8 +462,6 @@ public class OccultPotNotifier : ModuleBase
                         ImGui.SameLine();
                 }
             }
-            if (savedMarkers != null)
-                ImGui.TextDisabled("（携带撒娇罐中，标记由自动切换接管）");
 
             ImGui.Spacing();
 
@@ -452,9 +483,8 @@ public class OccultPotNotifier : ModuleBase
             if (config.AutoSwitchOnLure)
             {
                 using (ImRaii.PushIndent())
-                {
-                    ImGui.TextColored(KnownColor.Orange.ToVector4(), "将根据您刚才触发或完成的罐子智能切换标记。");
-                }
+                    ImGui.TextColored(KnownColor.Gray.ToVector4(),
+                        "自动按最近所在的罐子方位显示北罐 / 南罐；\n出现「再帮你找一次财宝」提示后自动切换到续罐点位。");
             }
 
             ImGui.Spacing();
@@ -507,20 +537,21 @@ public class OccultPotNotifier : ModuleBase
         HideDisplay();
 
         // 地图标记复位
-        lureActive   = false;
-        cofferPos    = Vector3.Zero;
-        savedMarkers = null;
-        currentMarkers = config.DefaultMarkers;
+        lureActive         = false;
+        cofferPos          = Vector3.Zero;
+        continuationActive = false;
+        autoSwitchEngaged  = false;
+        currentMarkers     = config.DefaultMarkers;
         ClearMapMarkers();
 
-        if (GameState.TerritoryIntendedUse != TerritoryIntendedUse.OccultCrescent) return;
+        if (!InOccultMapZone) return;
 
         FrameworkManager.Instance().Reg(OnUpdate, 1_000);
     }
 
     private void OnUpdate(IFramework _)
     {
-        if (GameState.TerritoryIntendedUse != TerritoryIntendedUse.OccultCrescent)
+        if (!InOccultMapZone)
         {
             FrameworkManager.Instance().Unreg(OnUpdate);
             HideDisplay();
@@ -546,6 +577,9 @@ public class OccultPotNotifier : ModuleBase
             pot.LastSeenAlive   = now;
             pot.SpawnTime       = fate.StartTimeEpoch;
             pot.LocallyObserved = true;
+
+            // 记录最近一次本地观察到的罐子方位（即「刚才打过的罐子」）
+            lastPotRegion = pot.FateID == 1976 ? PotRegion.North : PotRegion.South;
 
             if (!pot.Alive)
                 pot.Alive = true;
@@ -715,6 +749,33 @@ public class OccultPotNotifier : ModuleBase
 
     private void OnAreaMapRefresh(AddonEvent type, AddonArgs args) => markersDirty = true;
 
+    private unsafe void ShowBattleTalkDetour(UIModule* module, CStringPointer name, CStringPointer text, float duration, byte style)
+    {
+        showBattleTalkHook!.Original(module, name, text, duration, style);
+        HandlePotTalk(text.HasValue ? text.ExtractText() : string.Empty);
+    }
+
+    private unsafe void ShowBattleTalkImageDetour(
+        UIModule* module, CStringPointer name, CStringPointer text, float duration, uint image, byte style, int sound, uint entityID)
+    {
+        showBattleTalkImageHook!.Original(module, name, text, duration, image, style, sound, entityID);
+        HandlePotTalk(text.HasValue ? text.ExtractText() : string.Empty);
+    }
+
+    // 识别魔法罐「再帮你找一次财宝」（续罐）提示
+    private void HandlePotTalk(string line)
+    {
+        if (continuationActive || string.IsNullOrEmpty(line) || !InOccultMapZone) return;
+
+        // 严格匹配续罐提示「给我更多的圣灵药，我就再帮你找一次财宝！」
+        // 「更多的圣灵药」「再帮你找一次财宝」均为续罐独有，避免与首次提示重合
+        if (line.Contains("更多的圣灵药") && line.Contains("再帮你找一次财宝"))
+        {
+            continuationActive = true;
+            markersDirty       = true;
+        }
+    }
+
     // 检测「撒娇罐」状态，更新最近埋藏宝箱坐标与自动切换
     private void UpdateLure()
     {
@@ -747,42 +808,43 @@ public class OccultPotNotifier : ModuleBase
         lureActive = true;
         cofferPos  = OccultData.NearestCoffer(localPlayer!.Position);
 
-        if (config.AutoSwitchOnLure && savedMarkers == null)
+        if (config.AutoSwitchOnLure)
         {
-            savedMarkers   = currentMarkers;
-            currentMarkers = GetDynamicLureMarkers(localPlayer!.Position);
-            markersDirty   = true;
+            autoSwitchEngaged = true;
+
+            // 续罐阶段 → 续罐点位；否则按最近所在罐子方位显示北 / 南罐
+            var desired = continuationActive
+                              ? MarkerSet.Reroll
+                              : lastPotRegion == PotRegion.South
+                                  ? MarkerSet.SouthPot
+                                  : MarkerSet.NorthPot;
+
+            if (currentMarkers != desired)
+            {
+                currentMarkers = desired;
+                markersDirty   = true;
+            }
         }
-    }
-
-    private MarkerSet GetDynamicLureMarkers(Vector3 playerPos)
-    {
-        var north = pots[0];
-        var south = pots[1];
-
-        var distNorth = Vector3.Distance(playerPos, north.World);
-        var distSouth = Vector3.Distance(playerPos, south.World);
-
-        if (distNorth < 150f && distNorth < distSouth)
-            return MarkerSet.NorthPot;
-
-        if (distSouth < 150f && distSouth < distNorth)
-            return MarkerSet.SouthPot;
-            
-        return MarkerSet.Reroll;
+        else
+            DisengageAutoSwitch();
     }
 
     private void ClearLure()
     {
-        lureActive = false;
-        cofferPos  = Vector3.Zero;
+        lureActive         = false;
+        cofferPos          = Vector3.Zero;
+        continuationActive = false;
+        DisengageAutoSwitch();
+    }
 
-        if (savedMarkers != null)
-        {
-            currentMarkers = savedMarkers.Value;
-            savedMarkers   = null;
-            markersDirty   = true;
-        }
+    // 自动切换结束：把标记调回「什么都不显示」
+    private void DisengageAutoSwitch()
+    {
+        if (!autoSwitchEngaged) return;
+
+        autoSwitchEngaged = false;
+        currentMarkers    = MarkerSet.None;
+        markersDirty      = true;
     }
 
     private unsafe void UpdateMapMarkers()
@@ -859,22 +921,19 @@ public class OccultPotNotifier : ModuleBase
         markersDirty  = false;
     }
 
-    // 设置用户标记集合（携带撒娇罐时改保存的基准集合）
+    // 手动设置标记集合（同时会取消自动切换的接管）
     private void SetUserMarkers(MarkerSet set)
     {
+        autoSwitchEngaged     = false;
         config.DefaultMarkers = set;
-        if (savedMarkers == null)
-            currentMarkers = set;
-        else
-            savedMarkers = set;
-        markersDirty = true;
+        currentMarkers        = set;
+        markersDirty          = true;
         config.Save(this);
     }
 
     private void ToggleMarker(MarkerSet flag)
     {
-        var set = savedMarkers ?? currentMarkers;
-        SetUserMarkers(set.HasFlag(flag) ? set & ~flag : set | flag);
+        SetUserMarkers(currentMarkers.HasFlag(flag) ? currentMarkers & ~flag : currentMarkers | flag);
     }
 
     // 每帧绘制：埋藏宝箱圆圈 + 快速切换悬浮窗
@@ -917,34 +976,26 @@ public class OccultPotNotifier : ModuleBase
 
         if (ImGui.Begin("###OccultPotFastSwitcher", SwitcherFlags))
         {
-            var locked = savedMarkers != null;
-            using (ImRaii.Disabled(locked))
+            for (var i = 0; i < SwitchButtons.Length; i++)
             {
-                var active = savedMarkers ?? currentMarkers;
-                for (var i = 0; i < SwitchButtons.Length; i++)
+                var (label, flag) = SwitchButtons[i];
+                var on = currentMarkers.HasFlag(flag);
+
+                if (on)
                 {
-                    var (label, flag) = SwitchButtons[i];
-                    var on = active.HasFlag(flag);
-
-                    if (on)
-                    {
-                        ImGui.PushStyleColor(ImGuiCol.Button,        SwitchActiveColor);
-                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, SwitchActiveColor);
-                    }
-
-                    if (ImGui.Button($"{label}###Switch{flag}"))
-                        ToggleMarker(flag);
-
-                    if (on)
-                        ImGui.PopStyleColor(2);
-
-                    if (i != SwitchButtons.Length - 1)
-                        ImGui.SameLine();
+                    ImGui.PushStyleColor(ImGuiCol.Button,        SwitchActiveColor);
+                    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, SwitchActiveColor);
                 }
-            }
 
-            if (locked && ImGui.IsWindowHovered())
-                ImGui.SetTooltip("携带撒娇罐时自动标记进行中，暂不可手动切换");
+                if (ImGui.Button($"{label}###Switch{flag}"))
+                    ToggleMarker(flag);
+
+                if (on)
+                    ImGui.PopStyleColor(2);
+
+                if (i != SwitchButtons.Length - 1)
+                    ImGui.SameLine();
+            }
         }
 
         ImGui.End();
@@ -1245,6 +1296,12 @@ public class OccultPotNotifier : ModuleBase
         Overlay
     }
 
+    private enum PotRegion
+    {
+        North,
+        South
+    }
+
     [Flags]
     private enum MarkerSet : uint
     {
@@ -1293,7 +1350,7 @@ public class OccultPotNotifier : ModuleBase
 
         // 史官功能
         public bool   EnableArchivist          = false;
-        public string ArchivistRegex           = "lw罐|史官";
+        public string ArchivistRegex           = "lw罐|史官|礼问罐";
         public int    ArchivistCooldownSeconds = 60;
 
         // 地图标记
@@ -1301,7 +1358,6 @@ public class OccultPotNotifier : ModuleBase
         public bool      ShowFastSwitcher = true;
         public bool      SwitcherBelowMap;
         public bool      AutoSwitchOnLure = true;
-        public MarkerSet AutoSwitchFlags  = MarkerSet.NorthPot | MarkerSet.SouthPot | MarkerSet.Reroll;
         public bool      DrawCofferCircle = true;
         public Vector4   CircleColor      = new(1f, 0.85f, 0.2f, 1f);
     }
