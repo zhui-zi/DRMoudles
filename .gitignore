@@ -5,3 +5,5 @@ obj/
 .claude/
 *.user
 *.DotSettings.user
+Download/
+*.dll
