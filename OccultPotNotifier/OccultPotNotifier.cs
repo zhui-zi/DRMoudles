@@ -173,20 +173,21 @@ public class OccultPotNotifier : ModuleBase
             {
                 using (ImRaii.PushIndent())
                 {
-                    ImGui.TextUnformatted("频道:");
-                    ImGui.SameLine();
-                    ImGui.SetNextItemWidth(150f * GlobalUIScale);
-                    using var combo = ImRaii.Combo("###ChatChannel", CurrentChannelLabel(config.ChatCommand));
-                    if (combo)
+                    ImGui.TextUnformatted("频道 (可多选):");
+                    for (var i = 0; i < ChatChannels.Length; i++)
                     {
-                        foreach (var (cmd, label) in ChatChannels)
+                        var (cmd, label) = ChatChannels[i];
+
+                        var on = config.ChatCommands.Contains(cmd);
+                        if (ImGui.Checkbox($"{label}###Chat{i}", ref on))
                         {
-                            if (ImGui.Selectable($"{label} ({cmd})", cmd == config.ChatCommand))
-                            {
-                                config.ChatCommand = cmd;
-                                config.Save(this);
-                            }
+                            if (on) config.ChatCommands.Add(cmd);
+                            else    config.ChatCommands.Remove(cmd);
+                            config.Save(this);
                         }
+
+                        if (i % 4 != 3 && i != ChatChannels.Length - 1)
+                            ImGui.SameLine();
                     }
                 }
             }
@@ -292,10 +293,11 @@ public class OccultPotNotifier : ModuleBase
         if (config.SendTTS)
             NotifyHelperExtension.Speak(message);
 
-        if (config.SendChat)
+        if (config.SendChat && config.ChatCommands.Count > 0)
         {
             SetPotFlag(pot);
-            ChatManager.Instance().SendMessage($"{config.ChatCommand} 魔法罐约{minutes}分钟后在{pot.DirName}<flag>处刷新");
+            foreach (var cmd in config.ChatCommands)
+                ChatManager.Instance().SendMessage($"{cmd} 魔法罐约{minutes}分钟后在{pot.DirName}<flag>处刷新");
         }
     }
 
@@ -418,17 +420,6 @@ public class OccultPotNotifier : ModuleBase
         }
 
         return null;
-    }
-
-    private static string CurrentChannelLabel(string command)
-    {
-        foreach (var (cmd, label) in ChatChannels)
-        {
-            if (cmd == command)
-                return $"{label} ({cmd})";
-        }
-
-        return command;
     }
 
     private static HttpClient CreateClient()
@@ -751,10 +742,10 @@ public class OccultPotNotifier : ModuleBase
         public PotDisplayMode DisplayMode      = PotDisplayMode.DtrBar;
         public bool           UseOnlineTracker = true;
 
-        public bool   SendTTS          = true;
-        public bool   SendNotification = true;
-        public bool   SendChat;
-        public string ChatCommand = "/p";
-        public int    LeadSeconds = 300;
+        public bool            SendTTS          = true;
+        public bool            SendNotification = true;
+        public bool            SendChat;
+        public HashSet<string> ChatCommands     = ["/p"];
+        public int             LeadSeconds      = 300;
     }
 }
